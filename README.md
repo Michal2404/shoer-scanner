@@ -152,6 +152,17 @@ npm run dev
 
 ```bash
 curl -X POST "http://localhost:3001/analyze?user_id=<UUID>" \
-  -F "image=@./images/shoe_wall.jpg"
+  -F "image=@./images/shoe_wall_1.jpg"
 ```
 
+### Visual Debug Overlay (BBox + Labels)
+
+```bash
+curl -X POST "http://localhost:3001/analyze/overlay" \
+  -F "image=@./images/shoe_wall_1.jpg"
+```
+
+Returns JSON with:
+- `overlay_image_url` (annotated image in Supabase Storage)
+- `vision` (raw vision output)
+- `bbox_summary` (coverage stats)

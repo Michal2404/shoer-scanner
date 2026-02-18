@@ -1,6 +1,6 @@
 import OpenAI from 'openai';
 import { randomUUID } from 'crypto';
-import { z } from 'zod'
+import { z } from 'zod';
 import type {
   VisionResult,
   RecommendationsResult,
@@ -8,13 +8,75 @@ import type {
   Usage
 } from '../types/contracts.js';
 
-const MOCK_VISION = (process.env.MOCK_VISION || 'true').toLowerCase() === 'true';
-const MOCK_RANKING = (process.env.MOCK_VISION || 'true').toLowerCase() === 'true';
+function parseBooleanEnv(name: string, fallback: boolean): boolean {
+  const value = process.env[name];
+  if (!value) return fallback;
+  return value.toLowerCase() === 'true';
+}
+
+const MOCK_AI = parseBooleanEnv('MOCK_AI', true);
+const MOCK_VISION = parseBooleanEnv('MOCK_VISION', MOCK_AI);
+const MOCK_RANKING = parseBooleanEnv('MOCK_RANKING', MOCK_AI);
+const VISION_MAX_CANDIDATES = (() => {
+  const parsed = Number(process.env.VISION_MAX_CANDIDATES || 8);
+  if (!Number.isFinite(parsed)) return 8;
+  return Math.max(1, Math.min(20, Math.floor(parsed)));
+})();
 
 const apiKey = process.env.OPENAI_API_KEY || '';
 const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
 export const openai = apiKey ? new OpenAI({ apiKey }) : null;
+
+function clamp01(value: number): number {
+  return Math.max(0, Math.min(1, value));
+}
+
+function normalizeBbox(bbox: { x: number; y: number; w: number; h: number } | null): { x: number; y: number; w: number; h: number } | null {
+  if (!bbox) return null;
+
+  const x = clamp01(bbox.x);
+  const y = clamp01(bbox.y);
+  const w = Math.max(0.01, Math.min(clamp01(bbox.w), 1 - x));
+  const h = Math.max(0.01, Math.min(clamp01(bbox.h), 1 - y));
+
+  return { x, y, w, h };
+}
+
+function normalizeVisionResult(result: VisionResult): VisionResult {
+  const candidates = result.candidates.map(candidate => ({
+    ...candidate,
+    bbox: normalizeBbox(candidate.bbox)
+  }));
+
+  const missingBboxCount = candidates.filter(candidate => !candidate.bbox).length;
+  const errors = [...result.errors];
+  if (missingBboxCount > 0) {
+    errors.push({
+      code: 'VISION_PARTIAL_BBOX',
+      message: `${missingBboxCount} candidate(s) missing bbox due to ambiguity or occlusion.`
+    });
+  }
+
+  return { ...result, candidates, errors };
+}
+
+function patchVisionPayload(raw: any): any {
+  if (!raw || typeof raw !== 'object') return raw;
+
+  const patched = { ...raw };
+  if (Array.isArray(patched.candidates)) {
+    patched.candidates = patched.candidates.map((candidate: any) => {
+      if (!candidate || typeof candidate !== 'object') return candidate;
+      return {
+        ...candidate,
+        bbox: candidate.bbox ?? null
+      };
+    });
+  }
+
+  return patched;
+}
 
 /**
  * Schemas: validate that the model returns exactly what our API expects.
@@ -36,12 +98,11 @@ const VisionSchema = z.object({
             w: z.number().min(0).max(1),
             h: z.number().min(0).max(1)
           })
-          .nullable()
-          .optional(),
+          .nullable(),
         notes: z.string().nullable().optional()
       })
     )
-    .max(8),
+    .max(VISION_MAX_CANDIDATES),
   image_quality: z.object({
     lighting: z.enum(['good', 'ok', 'bad']),
     blur: z.enum(['none', 'mild', 'high']),
@@ -122,9 +183,27 @@ export async function runVision(args: { imageUrl: string; mimeType: string; buff
     return {
       request_id,
       candidates: [
-        { raw_label: 'Nike Pegasus 40', brand: 'Nike', model: 'Pegasus 40', confidence: 0.78 },
-        { raw_label: 'Brooks Ghost 15', brand: 'Brooks', model: 'Ghost 15', confidence: 0.74 },
-        { raw_label: 'Hoka Clifton 9', brand: 'Hoka', model: 'Clifton 9', confidence: 0.69 }
+        {
+          raw_label: 'Nike Pegasus 40',
+          brand: 'Nike',
+          model: 'Pegasus 40',
+          confidence: 0.78,
+          bbox: { x: 0.08, y: 0.22, w: 0.22, h: 0.18 }
+        },
+        {
+          raw_label: 'Brooks Ghost 15',
+          brand: 'Brooks',
+          model: 'Ghost 15',
+          confidence: 0.74,
+          bbox: { x: 0.36, y: 0.28, w: 0.2, h: 0.16 }
+        },
+        {
+          raw_label: 'Hoka Clifton 9',
+          brand: 'Hoka',
+          model: 'Clifton 9',
+          confidence: 0.69,
+          bbox: { x: 0.62, y: 0.31, w: 0.24, h: 0.19 }
+        }
       ],
       image_quality: { lighting: 'ok', blur: 'mild', occlusion: 'some' },
       errors: []
@@ -135,9 +214,10 @@ export async function runVision(args: { imageUrl: string; mimeType: string; buff
 Analyze this image of a retail running shoe wall.
 
 TASK:
-- Identify up to 8 distinct running shoe models visible.
+- Identify up to ${VISION_MAX_CANDIDATES} distinct running shoe models visible.
 - Prefer popular running shoe lines.
 - If unsure about exact version (e.g., Pegasus 40 vs 41), make best guess and lower confidence.
+- For each candidate, return a normalized bbox around one visible instance.
 
 OUTPUT:
 Return STRICT JSON ONLY in this format:
@@ -150,7 +230,7 @@ Return STRICT JSON ONLY in this format:
       "brand": "Nike",
       "model": "Pegasus 40",
       "confidence": 0.0,
-      "bbox": null,
+      "bbox": { "x": 0.1, "y": 0.2, "w": 0.2, "h": 0.15 },
       "notes": null
     }
   ],
@@ -164,7 +244,8 @@ Return STRICT JSON ONLY in this format:
 
 RULES:
 - confidence is between 0 and 1
-- bbox should be null unless you can estimate normalized coords reliably
+- bbox coordinates are normalized: x,y are top-left and w,h are width/height in [0,1]
+- prefer approximate bbox over null; use null only when the shoe cannot be localized
 - No markdown, no commentary, JSON only
 `;
 
@@ -179,14 +260,14 @@ RULES:
           role: 'user',
           content: [
             { type: 'input_text', text: prompt },
-            { type: 'input_image', image_url: dataUrl, detail: 'auto' }
+            { type: 'input_image', image_url: dataUrl, detail: 'high' }
           ]
         }
       ]
     });
 
     const rawText = resp.output_text;
-    const json = safeParseJsonFromModel(rawText);
+    const json = patchVisionPayload(safeParseJsonFromModel(rawText));
 
     const validated = VisionSchema.safeParse(json);
     if (!validated.success) {
@@ -203,7 +284,7 @@ RULES:
       };
     }
 
-    return validated.data;
+    return normalizeVisionResult(validated.data);
 
   } catch (e: any) {
     const status = e?.status ?? e?.response?.status ?? null;

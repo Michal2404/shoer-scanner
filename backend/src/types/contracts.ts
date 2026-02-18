@@ -6,7 +6,7 @@ export type VisionCandidate = {
   brand: string | null;
   model: string | null;
   confidence: number;
-  bbox?: { x: number; y: number; w: number; h: number } | null;
+  bbox: { x: number; y: number; w: number; h: number } | null;
   notes?: string | null;
 };
 
